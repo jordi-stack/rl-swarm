@@ -9,31 +9,31 @@ tf32: true
 dataset_id_or_path: 'openai/gsm8k'
 
 # Training arguments
-max_steps: 20 # Original 450
+max_steps: 100 # Dikurangi dari 400 ke nilai yang lebih moderat
 num_train_epochs: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 4 # Dikembalikan ke 4 untuk mengurangi penggunaan memori
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-learning_rate: 5.0e-7 # 1.0e-6 as in the deepseek math paper 5-e7 from https://hijkzzz.notion.site/unraveling-rlhf-and-its-variants-engineering-insights#147d9a33ecc9806090f3d5c749d31f05
+learning_rate: 1.0e-6 # Increased to DeepSeek math paper value for better learning
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 
 # GRPO arguments
 use_vllm: true
-num_generations: 4
-per_device_train_batch_size: 4
-beta: 0.001 # 0.04 as in the deepseek math paper 0.001 from https://hijkzzz.notion.site/unraveling-rlhf-and-its-variants-engineering-insights#147d9a33ecc9806090f3d5c749d31f05
+num_generations: 4 # Dikurangi kembali ke 4 untuk mengurangi penggunaan memori
+per_device_train_batch_size: 2 # Dikurangi dari 6 ke 2 untuk mengurangi penggunaan memori
+beta: 0.03 # Increased from 0.001 towards DeepSeek paper value (0.04) for better rewards
 max_prompt_length: 256
-max_completion_length: 1024
+max_completion_length: 512 # Dikurangi dari 1024 untuk mengurangi penggunaan memori
 
 # Logging arguments
 logging_strategy: steps
-logging_steps: 2
+logging_steps: 10 # Increased to reduce logging overhead
 report_to:
 - tensorboard
 save_strategy: "steps"
-save_steps: 25
+save_steps: 50 # Increased from 25 to save disk space and reduce I/O overhead
 seed: 42
 
 # Script arguments
