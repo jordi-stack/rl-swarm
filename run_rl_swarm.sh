@@ -1,9 +1,20 @@
 #!/bin/bash
 
-set -euo pipefail
+# Avoid strict error handling
+set -uo pipefail
 
 # General arguments
 ROOT=$PWD
+
+# Create log file for debugging but don't show all commands
+LOGFILE="$ROOT/rl_swarm_debug.log"
+touch $LOGFILE
+# Only log to file, don't show every command in terminal
+exec 5>&1
+exec 6>&2
+exec > >(tee -a "$LOGFILE") 2>&1
+
+echo "Log file enabled at: $LOGFILE (check this if you encounter issues)"
 
 export PUB_MULTI_ADDRS
 export PEER_MULTI_ADDRS
@@ -12,6 +23,7 @@ export IDENTITY_PATH
 export CONNECT_TO_TESTNET
 export ORG_ID
 export HF_HUB_DOWNLOAD_TIMEOUT=120  # 2 minutes
+export USE_NGROK=${USE_NGROK:-false}  # Default to not using ngrok
 
 # Check if public multi-address is given else set to default
 DEFAULT_PUB_MULTI_ADDRS=""
@@ -53,19 +65,121 @@ echo_blue() {
 
 ROOT_DIR="$(cd $(dirname ${BASH_SOURCE[0]}) && pwd)"
 
+# Create necessary directories
+mkdir -p "$ROOT_DIR/modal-login/temp-data"
+mkdir -p "$ROOT_DIR/ngrok_tmp"
+
+# Function to download and install ngrok
+install_ngrok() {
+    echo "Installing ngrok automatically..."
+    local NGROK_DIR="$ROOT_DIR/ngrok_tmp"
+    
+    # Download ngrok if not already downloaded
+    if [ ! -f "$NGROK_DIR/ngrok" ]; then
+        cd "$NGROK_DIR"
+        curl -s -o ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip
+        unzip -q ngrok.zip
+        chmod +x ngrok
+        cd "$ROOT_DIR"
+    fi
+    
+    # Add to PATH
+    export PATH="$NGROK_DIR:$PATH"
+    
+    # Verify installation
+    if ! command -v ngrok > /dev/null 2>&1; then
+        echo "Failed to install ngrok. Please install it manually and try again."
+        return 1
+    fi
+    
+    echo "Ngrok installed successfully at $NGROK_DIR/ngrok"
+    return 0
+}
+
+# Function to wait for userData.json to be created and extract ORG_ID
+wait_for_login_completion() {
+    local max_wait=300  # 5 minutes
+    local wait_count=0
+    
+    echo "Waiting for login completion..."
+    
+    # Delete any existing userData.json to avoid false detection
+    rm -f "$ROOT_DIR/modal-login/temp-data/userData.json" 2>/dev/null || true
+    
+    while [ ! -f "$ROOT_DIR/modal-login/temp-data/userData.json" ]; do
+        echo -n "."
+        sleep 2
+        wait_count=$((wait_count + 2))
+        
+        # Check every 30 seconds if API key is activated
+        if [ $((wait_count % 30)) -eq 0 ]; then
+            echo ""
+            echo "Still waiting for login completion... ($wait_count seconds elapsed)"
+            echo "Please login at the ngrok URL to continue."
+        fi
+        
+        if [ $wait_count -ge $max_wait ]; then
+            echo ""
+            echo "Timed out waiting for login completion."
+            echo "Do you want to continue waiting? (y/n)"
+            read -p "> " continue_waiting
+            
+            if [[ "$continue_waiting" != "y" ]]; then
+                echo "Login process aborted."
+                return 1
+            fi
+            
+            wait_count=0
+        fi
+    done
+    
+    echo ""
+    echo "Login data file found!"
+    
+    # Try to extract ORG_ID using multiple methods to ensure compatibility
+    ORG_ID=$(grep -o '"orgId":"[^"]*"' "$ROOT_DIR/modal-login/temp-data/userData.json" 2>/dev/null | cut -d'"' -f4 || echo "")
+    
+    if [ -z "$ORG_ID" ]; then
+        ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' "$ROOT_DIR/modal-login/temp-data/userData.json" 2>/dev/null || echo "")
+    fi
+    
+    if [ -z "$ORG_ID" ]; then
+        echo "Failed to extract ORG_ID from userData.json."
+        cat "$ROOT_DIR/modal-login/temp-data/userData.json"
+        echo "Please enter your ORG_ID manually:"
+        read -p "> " ORG_ID
+        return 0
+    fi
+    
+    echo "Successfully extracted ORG_ID: $ORG_ID"
+    return 0
+}
+
 # Function to clean up the server process upon exit
 cleanup() {
     echo_green ">> Shutting down trainer..."
 
-    # Remove modal credentials if they exist
-    rm -r $ROOT_DIR/modal-login/temp-data/*.json 2> /dev/null || true
+    # Kill server processes
+    if [ -n "${SERVER_PID:-}" ]; then
+        kill $SERVER_PID 2>/dev/null || true
+    fi
+
+    # Kill ngrok processes
+    if [ -n "${NGROK_PID:-}" ]; then
+        kill $NGROK_PID 2>/dev/null || true
+    fi
+    
+    # Kill any other ngrok processes
+    pkill -f ngrok 2>/dev/null || true
 
     # Kill all processes belonging to this script's process group
-    kill -- -$$ || true
+    kill -- -$$ 2>/dev/null || true
 
+    echo "Cleanup complete."
     exit 0
 }
 
+# Register cleanup to run on script exit
 trap cleanup EXIT
 
 echo -e "\033[38;5;224m"
@@ -88,6 +202,18 @@ while true; do
     case $yn in
         [Yy]*)  CONNECT_TO_TESTNET=true && break ;;
         [Nn]*)  CONNECT_TO_TESTNET=false && break ;;
+        *)  echo ">>> Please answer yes or no." ;;
+    esac
+done
+
+while true; do
+    echo -en $GREEN_TEXT
+    read -p ">> Would you like to use ngrok for remote access to the login page? [Y/n] " yn
+    echo -en $RESET_TEXT
+    yn=${yn:-Y}  # Default to "Y" if the user presses Enter
+    case $yn in
+        [Yy]*)  USE_NGROK=true && break ;;
+        [Nn]*)  USE_NGROK=false && break ;;
         *)  echo ">>> Please answer yes or no." ;;
     esac
 done
@@ -122,81 +248,129 @@ done
 if [ "$CONNECT_TO_TESTNET" = true ]; then
     # Run modal_login server.
     echo "Please login to create an Ethereum Server Wallet"
-    cd modal-login
-    # Check if the yarn command exists; if not, install Yarn.
-
-    # Node.js + NVM setup
+    cd modal-login || { echo "Could not change to modal-login directory"; exit 1; }
+    
+    # Check if .env file exists, create it if not
+    if [ ! -f ".env" ]; then
+        echo "Creating .env file"
+        echo "VITE_BASE_URL=http://localhost:3000" > .env
+        echo "VITE_API_URL=http://localhost:3000/api" >> .env
+        echo "SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT" >> .env
+    fi
+    
+    # Make sure node_modules directory exists
+    mkdir -p node_modules
+    
+    # Check for Node.js
+    echo "Checking for Node.js..."
     if ! command -v node > /dev/null 2>&1; then
-        echo "Node.js not found. Installing NVM and latest Node.js..."
-        export NVM_DIR="$HOME/.nvm"
-        if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-        fi
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-        nvm install node
+        echo "Node.js not found. Requesting manual ORG_ID..."
+        read -p "Please provide your ORG_ID: " ORG_ID
+        mkdir -p "$ROOT_DIR/modal-login/temp-data"
+        echo "{\"orgId\":\"$ORG_ID\"}" > "$ROOT_DIR/modal-login/temp-data/userData.json"
+        cd "$ROOT_DIR"
+        goto_training=true
     else
-        echo "Node.js is already installed: $(node -v)"
+        echo "Node.js found: $(node -v)"
     fi
-
-    if ! command -v yarn > /dev/null 2>&1; then
-        # Detect Ubuntu (including WSL Ubuntu) and install Yarn accordingly
-        if grep -qi "ubuntu" /etc/os-release 2> /dev/null || uname -r | grep -qi "microsoft"; then
-            echo "Detected Ubuntu or WSL Ubuntu. Installing Yarn via apt..."
-            curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
-            echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
-            sudo apt update && sudo apt install -y yarn
+    
+    # If we should skip to training
+    if [ "${goto_training:-false}" = true ]; then
+        echo "Skipping normal login flow and proceeding to training..."
+    else
+        echo "-------------------------------------------------"
+        echo "AUTOMATIC NGROK SETUP"
+        echo "-------------------------------------------------"
+        
+        # Check if ngrok is installed, if not, install it
+        if ! command -v ngrok > /dev/null 2>&1; then
+            install_ngrok || { 
+                echo "Failed to install ngrok automatically. Aborting."; 
+                exit 1; 
+            }
+        fi
+        
+        # Ask for ngrok auth token
+        echo "Do you have an ngrok auth token? (get one for free at https://dashboard.ngrok.com/get-started/your-authtoken)"
+        read -p "Enter your ngrok auth token (or press Enter to skip): " NGROK_TOKEN
+        
+        if [ -n "$NGROK_TOKEN" ]; then
+            ngrok config add-authtoken "$NGROK_TOKEN" || echo "Failed to add auth token, continuing anyway..."
         else
-            echo "Yarn not found. Installing Yarn globally with npm (no profile edits)…"
-            # This lands in $NVM_DIR/versions/node/<ver>/bin which is already on PATH
-            npm install -g --silent yarn
+            echo "No auth token provided. Ngrok may have limited functionality."
         fi
-    fi
-    yarn install
-    yarn dev > /dev/null 2>&1 & # Run in background and suppress output
-
-    SERVER_PID=$!  # Store the process ID
-    echo "Started server process: $SERVER_PID"
-    sleep 5
-
-    # Try to open the URL in the default browser
-    if open http://localhost:3000 2> /dev/null; then
-        echo_green ">> Successfully opened http://localhost:3000 in your default browser."
-    else
-        echo ">> Failed to open http://localhost:3000. Please open it manually."
-    fi
-
-    cd ..
-
-    echo_green ">> Waiting for modal userData.json to be created..."
-    while [ ! -f "modal-login/temp-data/userData.json" ]; do
-        sleep 5  # Wait for 5 seconds before checking again
-    done
-    echo "Found userData.json. Proceeding..."
-
-    ORG_ID=$(awk 'BEGIN { FS = "\"" } !/^[ \t]*[{}]/ { print $(NF - 1); exit }' modal-login/temp-data/userData.json)
-    echo "Your ORG_ID is set to: $ORG_ID"
-
-    # Wait until the API key is activated by the client
-    echo "Waiting for API key to become activated..."
-    while true; do
-        STATUS=$(curl -s "http://localhost:3000/api/get-api-key-status?orgId=$ORG_ID")
-        if [[ "$STATUS" == "activated" ]]; then
-            echo "API key is activated! Proceeding..."
-            break
+        
+        echo "-------------------------------------------------"
+        echo "STARTING LOGIN SERVER"
+        echo "-------------------------------------------------"
+        
+        # Start the server in the background
+        if command -v npm > /dev/null 2>&1; then
+            echo "Starting login server with npm..."
+            npm run dev > "$ROOT_DIR/server.log" 2>&1 &
+            SERVER_PID=$!
+            echo "Server started with PID: $SERVER_PID"
         else
-            echo "Waiting for API key to be activated..."
-            sleep 5
+            echo "npm not found, cannot start server."
+            exit 1
         fi
-    done
-
-    ENV_FILE="$ROOT"/modal-login/.env
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS version
-        sed -i '' "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
-    else
-        # Linux version
-        sed -i "3s/.*/SMART_CONTRACT_ADDRESS=$SWARM_CONTRACT/" "$ENV_FILE"
+        
+        # Wait for server to start
+        sleep 5
+        
+        # Start ngrok in the background
+        echo "Starting ngrok automatically..."
+        ngrok http 3000 > "$ROOT_DIR/ngrok.log" 2>&1 &
+        NGROK_PID=$!
+        echo "Ngrok started with PID: $NGROK_PID"
+        
+        # Wait for ngrok to establish tunnel
+        echo "Waiting for ngrok tunnel to be established..."
+        sleep 5
+        
+        # Try to get the ngrok URL with multiple attempts
+        NGROK_URL=""
+        for i in {1..5}; do
+            echo "Trying to get ngrok URL (attempt $i/5)..."
+            NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | grep -o '"public_url":"[^"]*' | grep -o 'https://[^"]*' || echo "")
+            
+            if [ -n "$NGROK_URL" ]; then
+                break
+            fi
+            
+            sleep 2
+        done
+        
+        if [ -z "$NGROK_URL" ]; then
+            echo "Failed to get ngrok URL automatically."
+            echo "Checking ngrok logs:"
+            cat "$ROOT_DIR/ngrok.log"
+            
+            echo "Please enter the ngrok URL manually:"
+            read -p "Enter the ngrok URL from another terminal running 'ngrok http 3000': " NGROK_URL
+            
+            if [ -z "$NGROK_URL" ]; then
+                echo "No ngrok URL provided. Aborting."
+                exit 1
+            fi
+        fi
+        
+        echo "-------------------------------------------------"
+        echo "LOGIN INSTRUCTIONS"
+        echo "-------------------------------------------------"
+        echo_green ">> Your login page is available at: $NGROK_URL"
+        echo "1. Open this URL in your browser: $NGROK_URL"
+        echo "2. Complete the login process"
+        echo "3. The script will automatically continue when login is completed"
+        echo ""
+        
+        # Wait for the login to complete and extract ORG_ID automatically
+        wait_for_login_completion || {
+            echo "Login process failed. Aborting."
+            exit 1
+        }
+        
+        cd "$ROOT_DIR"
     fi
 fi
 
@@ -214,8 +388,8 @@ else
     pip install flash-attn --no-build-isolation
 
     case "$PARAM_B" in
-        32 | 72) CONFIG_PATH="$ROOT/hivemind_exp/configs/gpu/grpo-qwen-2.5-${PARAM_B}b-bnb-4bit-deepseek-r1.yaml" && break ;;
-        0.5 | 1.5 | 7) CONFIG_PATH="$ROOT/hivemind_exp/configs/gpu/grpo-qwen-2.5-${PARAM_B}b-deepseek-r1.yaml" && break ;;
+        32 | 72) CONFIG_PATH="$ROOT/hivemind_exp/configs/gpu/grpo-qwen-2.5-${PARAM_B}b-bnb-4bit-deepseek-r1.yaml" ;;
+        0.5 | 1.5 | 7) CONFIG_PATH="$ROOT/hivemind_exp/configs/gpu/grpo-qwen-2.5-${PARAM_B}b-deepseek-r1.yaml" ;;
         *)  echo ">>> Please answer in [0.5, 1.5, 7, 32, 72]." ;;
     esac
     if [ "$USE_BIG_SWARM" = true ]; then
@@ -247,6 +421,7 @@ echo_blue ">> Post about rl-swarm on X/twitter! --> https://tinyurl.com/swarmtwe
 echo_blue ">> And remember to star the repo on GitHub! --> https://github.com/gensyn-ai/rl-swarm"
 
 if [ -n "$ORG_ID" ]; then
+    echo "Starting training with ORG_ID: $ORG_ID"
     python -m hivemind_exp.gsm8k.train_single_gpu \
         --hf_token "$HUGGINGFACE_ACCESS_TOKEN" \
         --identity_path "$IDENTITY_PATH" \
@@ -255,6 +430,7 @@ if [ -n "$ORG_ID" ]; then
         --config "$CONFIG_PATH" \
         --game "$GAME"
 else
+    echo "Starting training without ORG_ID"
     python -m hivemind_exp.gsm8k.train_single_gpu \
         --hf_token "$HUGGINGFACE_ACCESS_TOKEN" \
         --identity_path "$IDENTITY_PATH" \
