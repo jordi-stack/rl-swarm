@@ -90,6 +90,9 @@ If you would like to upload your model to Hugging Face, enter your Hugging Face 
 
 From this stage onward your device will begin training. You should see your peer register and vote on-chain [here](https://gensyn-testnet.explorer.alchemy.com/address/0x2fC68a233EF9E9509f034DD551FF90A79a0B8F82?tab=logs).
 
+You can also track your training progress in real time:
+- For the Math swarm (GSM8K dataset): [dashboard-math.gensyn.ai](https://dashboard-math.gensyn.ai)
+- For the Math Hard swarm (DAPO-Math 17K dataset): [dashboard-math-hard.gensyn.ai](https://dashboard-math-hard.gensyn.ai)
 
 ## Identity management
 

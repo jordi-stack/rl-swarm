@@ -10,6 +10,6 @@ transformers>=4.46.0
 trl
 unsloth @ git+https://github.com/gensyn-ai/unsloth@unpin_proto
 unsloth_zoo @ git+https://github.com/gensyn-ai/unsloth-zoo@unpin_proto
-vllm==0.8.2
+vllm==0.7.3
 web3
 xformers
